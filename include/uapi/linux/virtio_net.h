@@ -113,6 +113,7 @@ struct virtio_net_hdr {
 	/* See VIRTIO_NET_HDR_GSO_* */
 	__u8 gso_type;
 	__virtio16 hdr_len;		/* Ethernet + IP + tcp/udp hdrs */
+	__virtio16 pkt_len;
 	__virtio16 gso_size;		/* Bytes to append to hdr_len per frame */
 	__virtio16 csum_start;	/* Position to start checksumming from */
 	__virtio16 csum_offset;	/* Offset after that to place checksum */

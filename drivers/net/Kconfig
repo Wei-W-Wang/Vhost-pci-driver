@@ -310,6 +310,13 @@ config VIRTIO_NET
 	  This is the virtual network driver for virtio.  It can be used with
 	  lguest or QEMU based VMMs (like KVM or Xen).  Say Y or M.
 
+config VHOST_PCI_NET
+	tristate "Vhost-pci network driver"
+	depends on VIRTIO
+	---help---
+	  This is the vhost-pci network driver.  It can be used with
+	  Say Y or M.
+
 config NLMON
 	tristate "Virtual netlink monitoring device"
 	---help---

@@ -222,6 +222,7 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
 static void skb_xmit_done(struct virtqueue *vq)
 {
 	struct virtnet_info *vi = vq->vdev->priv;
+	printk(KERN_EMERG"%s called:.. \n", __func__);
 
 	/* Suppress further interrupts. */
 	virtqueue_disable_cb(vq);
@@ -657,7 +658,7 @@ static void skb_recv_done(struct virtqueue *rvq)
 {
 	struct virtnet_info *vi = rvq->vdev->priv;
 	struct receive_queue *rq = &vi->rq[vq2rxq(rvq)];
-
+	printk(KERN_EMERG"%s called:.. \n", __func__);
 	/* Schedule NAPI, Suppress further interrupts if successful. */
 	if (napi_schedule_prep(&rq->napi)) {
 		virtqueue_disable_cb(rvq);
@@ -708,7 +709,6 @@ static int virtnet_receive(struct receive_queue *rq, int budget)
 	struct virtnet_info *vi = rq->vq->vdev->priv;
 	unsigned int len, received = 0;
 	void *buf;
-
 	while (received < budget &&
 	       (buf = virtqueue_get_buf(rq->vq, &len)) != NULL) {
 		receive_buf(vi, rq, buf, len);
@@ -848,6 +848,9 @@ static int xmit_skb(struct send_queue *sq, struct sk_buff *skb)
 	sg_init_table(sq->sg, skb_shinfo(skb)->nr_frags + (can_push ? 1 : 2));
 	if (can_push) {
 		__skb_push(skb, hdr_len);
+		hdr->hdr.pkt_len =
+			__cpu_to_virtio16(virtio_is_little_endian(vi->vdev),
+					  skb->len);
 		num_sg = skb_to_sgvec(skb, sq->sg, 0, skb->len);
 		/* Pull header back to avoid skew in tx bytes calculations. */
 		__skb_pull(skb, hdr_len);

@@ -65,7 +65,7 @@ static irqreturn_t vp_vring_interrupt(int irq, void *opaque)
 	struct virtio_pci_vq_info *info;
 	irqreturn_t ret = IRQ_NONE;
 	unsigned long flags;
-
+printk(KERN_EMERG"%s called:.. \n", __func__);
 	spin_lock_irqsave(&vp_dev->lock, flags);
 	list_for_each_entry(info, &vp_dev->virtqueues, node) {
 		if (vring_interrupt(irq, info->vq) == IRQ_HANDLED)

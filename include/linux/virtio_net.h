@@ -95,6 +95,8 @@ static inline int virtio_net_hdr_from_skb(const struct sk_buff *skb,
 		hdr->flags = VIRTIO_NET_HDR_F_DATA_VALID;
 	} /* else everything is zero */
 
+	hdr->pkt_len = __cpu_to_virtio16(little_endian, skb->len);
+
 	return 0;
 }
 

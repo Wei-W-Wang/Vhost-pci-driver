@@ -318,7 +318,6 @@ static inline int virtqueue_add(struct virtqueue *_vq,
 		i = head;
 		descs_used = total_sg;
 	}
-
 	if (vq->vq.num_free < descs_used) {
 		pr_debug("Can't add buf len %i - avail = %i\n",
 			 descs_used, vq->vq.num_free);
@@ -644,6 +643,11 @@ static inline bool more_used(const struct vring_virtqueue *vq)
 	return vq->last_used_idx != virtio16_to_cpu(vq->vq.vdev, vq->vring.used->idx);
 }
 
+static inline bool more_avail(const struct vring_virtqueue *vq, u16 last_avail_idx)
+{
+	return last_avail_idx != virtio16_to_cpu(vq->vq.vdev, vq->vring.avail->idx);
+}
+
 /**
  * virtqueue_get_buf - get the next used buffer
  * @vq: the struct virtqueue we're talking about.
@@ -716,6 +720,61 @@ void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(virtqueue_get_buf);
+
+void *virtqueue_get_avail_buf(struct virtqueue *_vq, u16 *last_avail_idx, u32 *len)
+{
+	struct vring_virtqueue *vq = to_vvq(_vq);
+	struct vring *vr = &vq->vring;
+	struct vring_avail *avail = vr->avail;
+	struct vring_desc *desc;
+	void *ret;
+	u16 last_idx, head;
+
+	START_USE(vq);
+
+	/*
+	 * number_free indiactes the number of ring entry that can be filled with fresh buf,
+	 * if it equals to vr->num, the vring is basically empty.
+	 * */
+	if (_vq->num_free == vr->num) {
+		printk(KERN_EMERG"%s called: num_free == vr->num  \n", __func__);
+		return NULL;
+	}
+
+	/* Sanity check: When reaching here, we should have at least have one avail buffer */
+	if (!more_avail(vq, *last_avail_idx)) {
+		printk(KERN_EMERG"%s called: Sanity check failed - no more buffers in queue \n", __func__);
+		END_USE(vq);
+		return NULL;
+	}
+
+	if (unlikely(vq->broken)) {
+		END_USE(vq);
+		printk(KERN_EMERG"%s called: vq is broken \n", __func__);
+		return NULL;
+	}
+
+	/* Only get used array entries after they have been exposed by host. */
+	virtio_rmb(vq->weak_barriers);
+
+	last_idx = *last_avail_idx & (vq->vring.num - 1);
+	head = avail->ring[last_idx];
+
+	desc = vr->desc + head;
+	*len = desc->len;
+	(*last_avail_idx)++;
+//	buf = phys_to_virt(desc->addr);
+	/* detach_buf clears data, so grab it now. */
+	ret = vq->desc_state[head].data;
+	detach_buf(vq, head);
+
+	/* have one more entry that can be refilled with fresh buf */
+//	_vq->num_free++;
+	END_USE(vq);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(virtqueue_get_avail_buf);
 
 /**
  * virtqueue_disable_cb - disable callbacks

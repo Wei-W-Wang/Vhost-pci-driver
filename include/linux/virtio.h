@@ -58,7 +58,6 @@ bool virtqueue_kick_prepare(struct virtqueue *vq);
 bool virtqueue_notify(struct virtqueue *vq);
 
 void *virtqueue_get_buf(struct virtqueue *vq, unsigned int *len);
-void *virtqueue_get_buf_debug(struct virtqueue *vq, unsigned int *len);
 void *virtqueue_get_avail_buf(struct virtqueue *_vq, u16 *avail_last_idx, u32 *len);
 
 void virtqueue_disable_cb(struct virtqueue *vq);
@@ -76,6 +75,8 @@ void *virtqueue_detach_unused_buf(struct virtqueue *vq);
 unsigned int virtqueue_get_vring_size(struct virtqueue *vq);
 
 bool virtqueue_is_broken(struct virtqueue *vq);
+
+void vring_set_remote_peer_support(struct virtqueue *_vq, bool on);
 
 const struct vring *virtqueue_get_vring(struct virtqueue *vq);
 dma_addr_t virtqueue_get_desc_addr(struct virtqueue *vq);

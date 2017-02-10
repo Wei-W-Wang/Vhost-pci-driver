@@ -222,7 +222,6 @@ static struct page *get_a_page(struct receive_queue *rq, gfp_t gfp_mask)
 static void skb_xmit_done(struct virtqueue *vq)
 {
 	struct virtnet_info *vi = vq->vdev->priv;
-	printk(KERN_EMERG"%s called:.. \n", __func__);
 
 	/* Suppress further interrupts. */
 	virtqueue_disable_cb(vq);
@@ -658,7 +657,7 @@ static void skb_recv_done(struct virtqueue *rvq)
 {
 	struct virtnet_info *vi = rvq->vdev->priv;
 	struct receive_queue *rq = &vi->rq[vq2rxq(rvq)];
-	printk(KERN_EMERG"%s called:.. \n", __func__);
+
 	/* Schedule NAPI, Suppress further interrupts if successful. */
 	if (napi_schedule_prep(&rq->napi)) {
 		virtqueue_disable_cb(rvq);

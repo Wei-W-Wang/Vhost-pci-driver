@@ -76,10 +76,34 @@ struct vpnet_stats {
 	u64 rx_packets;
 };
 
-/* Internal representation of a receive virtqueue */
-struct vpnet_receive_queue {
-	/* Virtqueue associated with this receive_queue */
+struct peer_region_info {
+	uint64_t start;
+	uint64_t end;
+	uint64_t offset;
+};
+
+struct peer_mem_info {
+	void *pmem_base;
+	uint32_t nregions;
+	struct peer_region_info regions[MAX_GUEST_REGION];
+};
+
+struct peer_virtqueue {
+	/* Last available index we saw. */
+	u16 last_avail_idx;
+
+	/* Last index we used. */
+	u16 last_used_idx;
+
+	int enabled;
+	struct vring vring;
+};
+
+struct vpnet_rx_engine {
+	/* Virtqueue associated with this rx engine */
 	struct virtqueue *vq;
+
+	struct peer_virtqueue peer_tx;
 
 	u16 last_avail_idx;
 
@@ -101,51 +125,33 @@ struct vpnet_receive_queue {
 	char name[40];
 };
 
-struct peer_region_info {
-	uint64_t start;
-	uint64_t end;
-	uint64_t offset;
-};
+struct vpnet_tx_engine {
+	/* Virtqueue associated with this tx engine */
+	struct virtqueue *vq;
+	struct peer_virtqueue peer_rx;
 
-struct peer_mem_info {
-	void *pmem_base;
-	uint32_t nregions;
-	struct peer_region_info regions[MAX_GUEST_REGION];
-};
-
-struct mirrored_vq {
-	/* Last available index we saw. */
-	u16 last_avail_idx;
-
-	/* Last index we used. */
-	u16 last_used_idx;
-
-	int enabled;
-	struct vring vring;
+	/* Name of the tx engine: output.$index */
+	char name[40];
 };
 
 struct vpnet_info {
 	struct virtio_device *vdev;
 	struct net_device *dev;
 
-	struct vpnet_receive_queue *rq;
+	struct vpnet_tx_engine *tx;
+	struct vpnet_rx_engine *rx;
 
 	/*
 	 * Control receivq: host to gust
 	 */
-	struct virtqueue *crq;
+	struct virtqueue *ctrlq;
 
-	struct mirrored_vq *m_tq, *mrq;
-
-	struct work_struct crq_work;
+	struct work_struct ctrlq_work;
 
 	/* # queues used by the device */
-	u16 peer_vq_num;
+	u16 vq_pairs;
 
-	/* # of receive queues currently used by the driver */
-	u16 rq_num;
-
-	/* Packet virtio header size used by the peer*/
+	/* Packet virtio header size used by the peer */
 	u8 peer_hdr_len;
 
 	struct peer_mem_info pmem_info;
@@ -170,7 +176,7 @@ struct vpnet_info {
 	struct notifier_block nb;
 };
 
-struct vpnet_peer_buf {
+struct vpnet_tx_peer_buf {
 	volatile void *addr;
 	u32 len;
 };
@@ -211,15 +217,15 @@ static unsigned long mergeable_buf_to_ctx(void *buf, unsigned int truesize)
 	return (unsigned long)buf | (size - 1);
 }
 
-static int vpnet_add_recvbuf_mergeable(struct vpnet_receive_queue *rq, gfp_t gfp)
+static int vpnet_add_recvbuf_mergeable(struct vpnet_rx_engine *rx, gfp_t gfp)
 {
-	struct page_frag *alloc_frag = &rq->alloc_frag;
+	struct page_frag *alloc_frag = &rx->alloc_frag;
 	char *buf;
 	unsigned long ctx;
 	int err;
 	unsigned int len, hole;
 
-	len = get_mergeable_buf_len(&rq->mrg_avg_pkt_len);
+	len = get_mergeable_buf_len(&rx->mrg_avg_pkt_len);
 
 	if (unlikely(!skb_page_frag_refill(len, alloc_frag, gfp)))
 		return -ENOMEM;
@@ -239,8 +245,8 @@ static int vpnet_add_recvbuf_mergeable(struct vpnet_receive_queue *rq, gfp_t gfp
 		alloc_frag->offset += hole;
 	}
 
-	sg_init_one(rq->sg, buf, len);
-	err = virtqueue_add_inbuf(rq->vq, rq->sg, 1, (void *)ctx, gfp);
+	sg_init_one(rx->sg, buf, len);
+	err = virtqueue_add_inbuf(rx->vq, rx->sg, 1, (void *)ctx, gfp);
 	if (err < 0)
 		put_page(virt_to_head_page(buf));
 
@@ -254,7 +260,7 @@ static int vpnet_add_recvbuf_mergeable(struct vpnet_receive_queue *rq, gfp_t gfp
  * before we're receiving packets, or from refill_work which is
  * careful to disable receiving (using napi_disable).
  */
-static bool vpnet_try_fill_recv(struct vpnet_info *vi, struct vpnet_receive_queue *rq,
+static bool vpnet_try_fill_recv(struct vpnet_info *vi, struct vpnet_rx_engine *rx,
 			  gfp_t gfp)
 {
 	int err;
@@ -262,29 +268,29 @@ static bool vpnet_try_fill_recv(struct vpnet_info *vi, struct vpnet_receive_queu
 
 	gfp |= __GFP_COLD;
 	do {
-		err = vpnet_add_recvbuf_mergeable(rq, gfp);
+		err = vpnet_add_recvbuf_mergeable(rx, gfp);
 
 		oom = err == -ENOMEM;
 		if (err) {
 			printk(KERN_EMERG"%s called: Out of Memory \n", __func__);
 			break;
 		}
-	} while (rq->vq->num_free);
+	} while (rx->vq->num_free);
 	return !oom;
 }
 
-static void vpnet_napi_enable(struct vpnet_receive_queue *rq)
+static void vpnet_napi_enable(struct vpnet_rx_engine *rx)
 {
-	napi_enable(&rq->napi);
+	napi_enable(&rx->napi);
 
 	/* If all buffers were filled by other side before we napi_enabled, we
 	 * won't get another interrupt, so process any outstanding packets
 	 * now.  virtnet_poll wants re-enable the queue, so we disable here.
 	 * We synchronize against interrupts via NAPI_STATE_SCHED */
-	if (napi_schedule_prep(&rq->napi)) {
-		virtqueue_disable_cb(rq->vq);
+	if (napi_schedule_prep(&rx->napi)) {
+		virtqueue_disable_cb(rx->vq);
 		local_bh_disable();
-		__napi_schedule(&rq->napi);
+		__napi_schedule(&rx->napi);
 		local_bh_enable();
 	}
 }
@@ -296,12 +302,12 @@ static void refill_work(struct work_struct *work)
 	bool still_empty;
 	int i;
 
-	for (i = 0; i < vi->rq_num; i++) {
-		struct vpnet_receive_queue *rq = &vi->rq[i];
+	for (i = 0; i < vi->vq_pairs; i++) {
+		struct vpnet_rx_engine *rx = &vi->rx[i];
 
-		napi_disable(&rq->napi);
-		still_empty = !vpnet_try_fill_recv(vi, rq, GFP_KERNEL);
-		vpnet_napi_enable(rq);
+		napi_disable(&rx->napi);
+		still_empty = !vpnet_try_fill_recv(vi, rx, GFP_KERNEL);
+		vpnet_napi_enable(rx);
 
 		/* In theory, this can happen: if we don't get any buffers in
 		 * we will *never* try to fill again.
@@ -311,52 +317,53 @@ static void refill_work(struct work_struct *work)
 	}
 }
 
-static inline bool mrq_more_avail(struct mirrored_vq *mrq)
+/* FIXME */
+static inline bool mrq_more_avail(struct peer_virtqueue *pvq)
 {
 	/* <CF: virtio16_to_cpu> */
-	return mrq->vring.avail->idx - mrq->last_avail_idx > 0 ? 1 : 0;
+	return pvq->vring.avail->idx - pvq->last_avail_idx > 0 ? 1 : 0;
 }
 
-static void __add_mvq_used_n(struct mirrored_vq *m_vq,
+static void __add_peer_used_n(struct peer_virtqueue *pvq,
 			struct vring_used_elem *heads,
 			unsigned count)
 {
+	volatile struct vring *pvring = &pvq->vring;
 	volatile struct vring_used_elem *used;
-	volatile struct vring *m_vr = &m_vq->vring;
 	int start;
 
-	start = m_vq->last_used_idx & (m_vr->num - 1);
-	used = m_vr->used->ring + start;
+	start = pvq->last_used_idx & (pvring->num - 1);
+	used = pvring->used->ring + start;
 	if (count == 1) {
 		used->id = heads[0].id;
 		used->len = heads[0].len;
 	} else {
 		memcpy((void *)used, heads, count * sizeof(*used));
 	}
-	m_vq->last_used_idx += count;
+	pvq->last_used_idx += count;
 }
 
-static int vpnet_add_mvq_used_n(struct mirrored_vq *m_vq,
+static int vpnet_add_peer_used_n(struct peer_virtqueue *pvq,
 				struct vring_used_elem *heads,
 				unsigned count)
 {
-	volatile struct vring *m_vr = &m_vq->vring;
+	volatile struct vring *pvring = &pvq->vring;
 	int start, n;
 
-	start = m_vq->last_used_idx & (m_vr->num - 1);
-	n = m_vr->num - start;
+	start = pvq->last_used_idx & (pvring->num - 1);
+	n = pvring->num - start;
 	/* Boundary check*/
 	if (n < count) {
-		__add_mvq_used_n(m_vq, heads, n);
+		__add_peer_used_n(pvq, heads, n);
 		count -= n;
 		heads += n;
 	}
-	__add_mvq_used_n(m_vq, heads, count);
+	__add_peer_used_n(pvq, heads, count);
 
 	/* order guarantee: buf filled before index updated */
 	smp_wmb();
 
-	m_vr->used->idx = m_vq->last_used_idx;
+	pvring->used->idx = pvq->last_used_idx;
 
 	return 0;
 }
@@ -380,9 +387,9 @@ static unsigned vpnet_next_desc(struct vring_desc *desc)
 	return next;
 }
 
-static void *vpnet_rq_get_buf(struct vpnet_receive_queue *rq, u32 *len)
+static void *vpnet_rx_get_buf(struct vpnet_rx_engine *rx, u32 *len)
 {
-	return virtqueue_get_avail_buf(rq->vq, &rq->last_avail_idx, len);
+	return virtqueue_get_avail_buf(rx->vq, &rx->last_avail_idx, len);
 }
 
 static inline struct virtio_net_hdr_mrg_rxbuf *skb_vnet_hdr(struct sk_buff *skb)
@@ -392,7 +399,7 @@ static inline struct virtio_net_hdr_mrg_rxbuf *skb_vnet_hdr(struct sk_buff *skb)
 
 /* Called from bottom half context */
 static struct sk_buff *vpnet_page_to_skb(struct vpnet_info *vi,
-					 struct vpnet_receive_queue *rq,
+					 struct vpnet_rx_engine *rx,
 					 struct page *page,
 					 unsigned int offset,
 					 unsigned int len,
@@ -406,7 +413,7 @@ static struct sk_buff *vpnet_page_to_skb(struct vpnet_info *vi,
 	p = page_address(page) + offset;
 
 	/* copy small packet so we can reuse these pages for small data */
-	skb = napi_alloc_skb(&rq->napi, GOOD_COPY_LEN);
+	skb = napi_alloc_skb(&rx->napi, GOOD_COPY_LEN);
 	if (unlikely(!skb))
 		return NULL;
 
@@ -445,130 +452,144 @@ static unsigned int mergeable_ctx_to_buf_truesize(unsigned long mrg_ctx)
 	return (truesize + 1) * MERGEABLE_BUFFER_ALIGN;
 }
 
-struct sk_buff *vpnet_rbuf_to_skb(struct vpnet_info *vi,
-				  struct vpnet_receive_queue *rq,
-				  void *r_buf, u32 len)
+struct sk_buff *vpnet_buf_to_skb(struct vpnet_info *vi,
+				  struct vpnet_rx_engine *rx,
+				  void *buf, u32 len)
 {
 	struct sk_buff *skb;
-	struct page *page = virt_to_head_page(r_buf);
-	int offset = r_buf - page_address(page);
-	unsigned int truesize = max(len, mergeable_ctx_to_buf_truesize((unsigned long)r_buf));
+	struct page *page = virt_to_head_page(buf);
+	int offset = buf - page_address(page);
+	unsigned int truesize = max(len, mergeable_ctx_to_buf_truesize((unsigned long)buf));
 
-	skb = vpnet_page_to_skb(vi, rq, page, offset, len, truesize);
+	skb = vpnet_page_to_skb(vi, rx, page, offset, len, truesize);
 	return skb;
 }
 
-static int vpnet_receive(struct vpnet_receive_queue *rq)
+static bool vpnet_rx_engine_poll(struct vpnet_rx_engine *rx)
 {
-	struct vpnet_info *vi = rq->vq->vdev->priv;
+	struct peer_virtqueue *peer_tx = &rx->peer_tx;
+	struct vring *peer_vring = &peer_tx->vring;
+	struct vring_avail *peer_avail = peer_vring->avail;
+        volatile u16 *peer_avail_idx = &peer_avail->idx;
+
+	if (*peer_avail_idx == peer_tx->last_avail_idx)
+		return 0;
+
+	/* Sanity check: abnormally too many packts */
+	if (unlikely((u16)(*peer_avail_idx - peer_tx->last_avail_idx) >
+	    peer_vring->num)) {
+		printk(KERN_EMERG"%s called: abnormally too many packts in peer tx, *peer_avail_idx=%d, peer_tx->last_avail_idx = %d  \n", __func__, *peer_avail_idx, peer_tx->last_avail_idx);
+		return 0;
+	}
+
+	return 1;
+}
+
+static unsigned int receive_buf(struct vpnet_rx_engine *rx)
+{
+
+	struct vpnet_info *vi = rx->vq->vdev->priv;
 	struct peer_mem_info *pmem_info = &vi->pmem_info;
-	struct mirrored_vq *m_rq = vi->mrq;
-	struct vring *m_vr = &m_rq->vring;
-	struct vring_avail *m_avail = m_vr->avail;
-        volatile u16 *m_avail_idx;
-	u16 m_start;
-	struct vring_desc *m_desc;
-	void *m_buf, *r_buf;
-	unsigned int m_head, i, rbuf_len, received = 0;
+	struct peer_virtqueue *peer_tx = &rx->peer_tx;
+	struct vring *peer_vring = &peer_tx->vring;
+	struct vring_avail *peer_avail = peer_vring->avail;
+	u16 peer_start;
+
+	struct vring_desc *peer_desc;
+	void *peer_buf, *my_buf;
+	unsigned int i, peer_head, my_buf_len, received = 0;
 
 	volatile struct virtio_net_hdr_mrg_rxbuf *hdr;
 
-	struct vring_used_elem m_used;
+	struct vring_used_elem peer_used;
 	struct net_device *dev = vi->dev;
 	__virtio16 pkt_len;
 	struct sk_buff *skb;
 	struct vpnet_stats *stats = this_cpu_ptr(vi->stats);
 
-	/* 1. check MRQ: any packets to receive? */
-	m_avail_idx = &m_avail->idx;
-	if (*m_avail_idx == m_rq->last_avail_idx)
+	/*1. got a buf to receive? */
+	if (!vpnet_rx_engine_poll(rx))
 		return 0;
 
-	/* Sanity check: abnormally too many packts */
-	if (unlikely((u16)(*m_avail_idx - m_rq->last_avail_idx) > m_vr->num)) {
-		printk(KERN_EMERG"%s called: abnormally too many packts in m_rq", __func__);
-		return 0;
-	}
-
-	/* 2. Get m_buf */
-	m_start = m_rq->last_avail_idx & (m_vr->num - 1);
+	/* 2. Get peer_buf */
+	peer_start = peer_tx->last_avail_idx & (peer_vring->num - 1);
 	/* grab the next head descriptor number */
-	m_head = m_avail->ring[m_start];
+	peer_head = peer_avail->ring[peer_start];
 	/* Sanity check */
-	if (unlikely(m_head > m_vr->num)) {
+	if (unlikely(peer_head > peer_vring->num)) {
 		printk(KERN_EMERG"%s called: vring_head > vr->num \n",
 		       __func__);
 		return 0;
 	}
-
-	/* OK, MRQ is ready to grab.. Let's go! */
-	i = m_head;
+	/* OK, peer vq is ready to grab.. Let's go! */
+	i = peer_head;
 
 	do {
 rbuf_retry:
-		/* 3. check RQ: can we get free buffer to receive the packets */
-		r_buf = vpnet_rq_get_buf(vi->rq, &rbuf_len);
+		/* 3. check my vq: can we get free buffer to receive the packets */
+		my_buf = vpnet_rx_get_buf(vi->rx, &my_buf_len);
 		/* No more avail buf? Let's fill some */
-		if (r_buf == NULL) {
+		if (my_buf == NULL) {
 			printk(KERN_EMERG"%s called: r_buf==========NULL\n", __func__);
-			if (!vpnet_try_fill_recv(vi, rq, GFP_ATOMIC)) {
+			if (!vpnet_try_fill_recv(vi, rx, GFP_ATOMIC)) {
 				schedule_delayed_work(&vi->refill, 0);
 				return 0;
 			}
 			/* Looks like we've got some fresh buffer..yeah! */
 			goto rbuf_retry;
 		}
-		r_buf = mergeable_ctx_to_buf_address((unsigned long)r_buf);
+		my_buf = mergeable_ctx_to_buf_address((unsigned long)my_buf);
 
-		m_desc = m_vr->desc + i;
-		m_buf = (void *)peer_to_local(pmem_info, m_desc->addr);
-		if (m_buf == NULL) {
-			printk(KERN_EMERG"%s called: m_buf == null", __func__);
+		peer_desc = peer_vring->desc + i;
+		peer_buf = (void *)peer_to_local(pmem_info, peer_desc->addr);
+		if (peer_buf == NULL) {
+			printk(KERN_EMERG"%s called: peer_buf == null", __func__);
 			return 0;
 		}
 
-		hdr = m_buf;
+		hdr = peer_buf;
 		pkt_len = hdr->hdr.pkt_len;
 
 		/* 4. Copy */
-		memcpy(r_buf, (void *)m_buf, hdr->hdr.pkt_len);
+		memcpy(my_buf, (void *)peer_buf, hdr->hdr.pkt_len);
 
 		/* 5. skb delivery */
-		skb = vpnet_rbuf_to_skb(vi, rq, r_buf, hdr->hdr.pkt_len);
+		skb = vpnet_buf_to_skb(vi, rx, my_buf, hdr->hdr.pkt_len);
 		skb->protocol = eth_type_trans(skb, dev);
-		napi_gro_receive(&rq->napi, skb);
+		napi_gro_receive(&rx->napi, skb);
 
 		/* 6. statistics update */
 		u64_stats_update_begin(&stats->rx_syncp);
 		stats->rx_bytes += skb->len;
 		stats->rx_packets++;
 		u64_stats_update_end(&stats->rx_syncp);
-
 		received++;
-	} while((i = vpnet_next_desc(m_desc)) != -1);
+	} while((i = vpnet_next_desc(peer_desc)) != -1);
 
-	/* 7. MRQ Used */
-	m_used.id = m_head;
-	m_used.len = pkt_len;
-	vpnet_add_mvq_used_n(m_rq, &m_used, 1);
-	(m_rq->last_avail_idx)++;
+	/* 7. peer Used */
+	peer_used.id = peer_head;
+	peer_used.len = pkt_len;
+	vpnet_add_peer_used_n(peer_tx, &peer_used, 1);
+	(peer_tx->last_avail_idx)++;
 
-	ewma_pkt_len_add(&rq->mrg_avg_pkt_len, skb->len);
+	ewma_pkt_len_add(&rx->mrg_avg_pkt_len, skb->len);
 
 	return received;
 }
 
-static int vpnet_poll(struct napi_struct *napi, int budget)
+static int vpnet_rx_engine_run(struct vpnet_rx_engine *rx, int budget)
 {
-	struct vpnet_receive_queue *rq =
-		container_of(napi, struct vpnet_receive_queue, napi);
-	struct vpnet_info *vi = rq->vq->vdev->priv;
+	struct vpnet_info *vi = rx->vq->vdev->priv;
 	unsigned int received = 0;
 
-	received = vpnet_receive(rq);
-	if (rq->vq->num_free > virtqueue_get_vring_size(rq->vq) / 2) {
-		if (!vpnet_try_fill_recv(vi, rq, GFP_ATOMIC)) {
-			printk(KERN_EMERG"%s called: delay the rq buffer fill \n", __func__);
+	while (received < budget &&
+	       vpnet_rx_engine_poll(rx)) {
+		received = receive_buf(rx);
+	}
+
+	if (rx->vq->num_free > virtqueue_get_vring_size(rx->vq) / 2) {
+		if (!vpnet_try_fill_recv(vi, rx, GFP_ATOMIC)) {
+			printk(KERN_EMERG"%s called: delay the rx buffer fill \n", __func__);
 			schedule_delayed_work(&vi->refill, 0);
 		}
 	}
@@ -576,26 +597,57 @@ static int vpnet_poll(struct napi_struct *napi, int budget)
 	return received;
 }
 
-static int vpnet_alloc_rqs(struct vpnet_info *vi)
+static int vpnet_poll(struct napi_struct *napi, int budget)
+{
+	struct vpnet_rx_engine *rx =
+		container_of(napi, struct vpnet_rx_engine, napi);
+	unsigned int received = 0;
+
+	received = vpnet_rx_engine_run(rx, budget);
+
+	/* Out of Packets */
+	if (received < budget) {
+//		r = virtqueue_enable_cb_prepare(rx->vq);
+		napi_complete_done(napi, received);
+		if (unlikely(vpnet_rx_engine_poll(rx)) &&
+		    napi_schedule_prep(napi)) {
+//			virtqueue_disable_cb(rx->vq);
+			__napi_schedule(napi);
+
+		}
+	}
+
+	return received;
+}
+
+static int vpnet_alloc_engines(struct vpnet_info *vi)
 {
 	int i;
-	u16 rq_num = vi->rq_num;
+	u16 vq_pairs = vi->vq_pairs;
 
-	vi->rq = kzalloc(sizeof(*vi->rq) * rq_num, GFP_KERNEL);
-	if (!vi->rq)
-		return -ENOMEM;
+	vi->tx = kzalloc(sizeof(struct vpnet_tx_engine) * vq_pairs, GFP_KERNEL);
+	if (!vi->tx)
+		goto err_tx;
+	vi->rx = kzalloc(sizeof(struct vpnet_rx_engine) * vq_pairs, GFP_KERNEL);
+	if (!vi->rx)
+		goto err_rx;
 
 	INIT_DELAYED_WORK(&vi->refill, refill_work);
-	for (i = 0; i < rq_num; i++) {
-		vi->rq[i].pages = NULL;
-		netif_napi_add(vi->dev, &vi->rq[i].napi, vpnet_poll,
+	for (i = 0; i < vq_pairs; i++) {
+		vi->rx[i].pages = NULL;
+		netif_napi_add(vi->dev, &vi->rx[i].napi, vpnet_poll,
 			       napi_weight);
 
-		sg_init_table(vi->rq[i].sg, ARRAY_SIZE(vi->rq[i].sg));
-		ewma_pkt_len_init(&vi->rq[i].mrg_avg_pkt_len);
+		sg_init_table(vi->rx[i].sg, ARRAY_SIZE(vi->rx[i].sg));
+		ewma_pkt_len_init(&vi->rx[i].mrg_avg_pkt_len);
 	}
 
 	return 0;
+
+err_rx:
+	kfree(vi->tx);
+err_tx:
+	return -ENOMEM;
 }
 
 static void vpnet_free_buf(struct ctrlq_buf *buf)
@@ -649,48 +701,49 @@ static void handle_pmem_msg(struct vpnet_info *vi,
 	}
 }
 
-#define VPNET_MIRROR_TX 0
-#define VPNET_MIRROR_RX 1
+#define VPNET_PEER_RX 0
+#define VPNET_PEER_TX 1
 static void handle_pvq_msg(struct vpnet_info *vi,
                                struct peer_vqs_msg *pvqs_msg)
 {
-	struct mirrored_vq *m_tq, *mrq;
+	struct peer_virtqueue *peer_rx, *peer_tx;
 	struct peer_vq_msg *pvq_msg;
 	struct peer_mem_info *pmem_info = &vi->pmem_info;
-	uint32_t i, mvq_num, nvqs;
-	struct vring *vr;
+	uint32_t i, total_vqs;
+	struct vring *peer_vring;
 	void *desc_addr, *avail_addr, *used_addr;
+printk(KERN_EMERG"%s called.. 1\n", __func__);
 
-	nvqs = pvqs_msg->nvqs;
-	if (nvqs != vi->peer_vq_num)
-		printk("%s called: peer_vq_num error \n", __func__);
+	total_vqs = pvqs_msg->nvqs;
+	if (total_vqs != vi->vq_pairs * 2)
+		printk("%s called: peer_virtqueue_num error \n", __func__);
 
-	for (i = 0; i < nvqs; i++) {
-		mvq_num = i / 2;
-		m_tq = &vi->m_tq[mvq_num];
-		mrq = &vi->mrq[mvq_num];
+	for (i = 0; i < total_vqs; i++) {
 		pvq_msg = &pvqs_msg->pvq_msg[i];
+		peer_rx = &vi->tx[i/2].peer_rx;
+		peer_tx = &vi->rx[i/2].peer_tx;
 		desc_addr = (void *)peer_to_local(pmem_info, pvq_msg->desc_gpa);
 		avail_addr = (void *)peer_to_local(pmem_info, pvq_msg->avail_gpa);
 		used_addr = (void *)peer_to_local(pmem_info, pvq_msg->used_gpa);
-		if (pvq_msg->vring_num % 2 == VPNET_MIRROR_TX) {
-			vr = &m_tq->vring;
-			vr->num = 256;
-			vr->desc = desc_addr;
-			vr->avail = avail_addr;
-			vr->used = used_addr;
-			m_tq->last_avail_idx = 0;
-			m_tq->last_used_idx = 0;
-			m_tq->enabled = pvq_msg->vring_enable;
+
+		if (pvq_msg->vring_num % 2 == VPNET_PEER_RX) {
+			peer_vring = &peer_rx->vring;
+			peer_vring->num = 256;
+			peer_vring->desc = desc_addr;
+			peer_vring->avail = avail_addr;
+			peer_vring->used = used_addr;
+			peer_rx->last_avail_idx = 0;
+			peer_rx->last_used_idx = 0;
+			peer_rx->enabled = pvq_msg->vring_enable;
 		} else {
-			vr = &mrq->vring;
-			vr->num = 256;
-			vr->desc = desc_addr;
-			vr->avail = avail_addr;
-			vr->used = used_addr;
-			mrq->last_avail_idx = 0;
-			mrq->last_used_idx = 0;
-			mrq->enabled = pvq_msg->vring_enable;
+			peer_vring = &peer_tx->vring;
+			peer_vring->num = 256;
+			peer_vring->desc = desc_addr;
+			peer_vring->avail = avail_addr;
+			peer_vring->used = used_addr;
+			peer_tx->last_avail_idx = 0;
+			peer_tx->last_used_idx = 0;
+			peer_tx->enabled = pvq_msg->vring_enable;
 		}
 	}
 }
@@ -718,20 +771,20 @@ static void vpnet_config_changed(struct virtio_device *vdev)
 
 	schedule_work(&vi->config_work);
 }
-static void crq_work_handler(struct work_struct *work)
+static void ctrlq_work_handler(struct work_struct *work)
 {
 	struct ctrlq_buf *buf;
 	struct vpnet_controlq_msg *msg;
 	struct peer_mem_msg *pmem_msg;
         struct peer_vqs_msg *pvqs_msg;
 	struct vpnet_info *vi;
-	struct virtqueue *crq;
+	struct virtqueue *ctrlq;
 	unsigned int len;
 
-	vi = container_of(work, struct vpnet_info, crq_work);
-	crq = vi->crq;
+	vi = container_of(work, struct vpnet_info, ctrlq_work);
+	ctrlq = vi->ctrlq;
 
-	while ((buf = virtqueue_get_buf(crq, &len))) {
+	while ((buf = virtqueue_get_buf(ctrlq, &len))) {
 		buf->len = len;
 		buf->offset = 0;
 		msg = (struct vpnet_controlq_msg *)buf->buf;
@@ -748,23 +801,49 @@ static void crq_work_handler(struct work_struct *work)
 			printk("%s called: default.. \n", __func__);
 		}
 
-		if (vpnet_add_inbuf(crq, buf) < 0) {
+		if (vpnet_add_inbuf(ctrlq, buf) < 0) {
 			printk("%s: Error adding buffer to queue \n", __func__);
 			vpnet_free_buf(buf);
 		}
 	}
 }
 
-static void crq_intr(struct virtqueue *crq)
+static void ctrlq_intr(struct virtqueue *ctrlq)
 {
-	struct vpnet_info *vi = crq->vdev->priv;
+	struct vpnet_info *vi = ctrlq->vdev->priv;
 
-	schedule_work(&vi->crq_work);
+	schedule_work(&vi->ctrlq_work);
 }
 
-static void skb_recv_done(struct virtqueue *rvq)
+static int vq2rx(struct virtqueue *vq)
 {
-	printk("%s called..\n", __func__);
+	return vq->index / 2;
+}
+
+static void skb_recv_done(struct virtqueue *vq)
+{
+	struct vpnet_info *vi = vq->vdev->priv;
+	struct vpnet_rx_engine *rx = &vi->rx[vq2rx(vq)];
+	/* Schedule NAPI, Suppress further interrupts if successful. */
+	if (napi_schedule_prep(&rx->napi)) {
+//		virtqueue_disable_cb(vq);
+		__napi_schedule(&rx->napi);
+	}
+}
+
+static void skb_xmit_done(struct virtqueue *vq)
+{
+//	printk(KERN_EMERG"%s called..\n", __func__);
+}
+
+static int rxq2vq(int rxq)
+{
+	return rxq * 2;
+}
+
+static int txq2vq(int txq)
+{
+	return txq * 2 + 1;
 }
 
 static int vpnet_find_vqs(struct vpnet_info *vi)
@@ -772,11 +851,11 @@ static int vpnet_find_vqs(struct vpnet_info *vi)
 	vq_callback_t **callbacks;
 	struct virtqueue **vqs;
 	int ret = -ENOMEM;
-	int i, total_vqs;
+	uint32_t i, total_vqs;
 	const char **names;
-	u16 rq_num = vi->peer_vq_num / 2;
+	u16 vq_pairs = vi->vq_pairs;
 
-	total_vqs = rq_num + 1;
+	total_vqs = vq_pairs * 2 + 1;
 	/* Allocate space for find_vqs parameters */
 	vqs = kzalloc(total_vqs * sizeof(*vqs), GFP_KERNEL);
 	if (!vqs)
@@ -789,14 +868,17 @@ static int vpnet_find_vqs(struct vpnet_info *vi)
 		goto err_names;
 
         /* Controlq Parameters */
-	names[0] = "control_rx";
-        callbacks[0] = crq_intr;
+	names[total_vqs - 1] = "controlq";
+        callbacks[total_vqs - 1] = ctrlq_intr;
 
-        /* Receiveq Parameters */
-	for (i = 0; i < rq_num; i++) {
-		callbacks[i+1] = skb_recv_done;
-		sprintf(vi->rq[i+1].name, "input.%d", i);
-		names[i+1] = vi->rq[i+1].name;
+        /* tx/rx vq Parameters */
+	for (i = 0; i < vq_pairs; i++) {
+		callbacks[rxq2vq(i)] = skb_recv_done;
+		callbacks[txq2vq(i)] = skb_xmit_done;
+		sprintf(vi->rx[i].name, "input.%d", i);
+		sprintf(vi->tx[i].name, "output.%d", i);
+		names[rxq2vq(i)] = vi->rx[i].name;
+		names[txq2vq(i)] = vi->tx[i].name;
 	}
 
 	ret = vi->vdev->config->find_vqs(vi->vdev, total_vqs, vqs, callbacks,
@@ -804,9 +886,13 @@ static int vpnet_find_vqs(struct vpnet_info *vi)
 	if (ret)
 		goto err_find;
 
-	vi->crq = vqs[0];
-	for (i = 0; i < rq_num; i++)
-		vi->rq[i].vq = vqs[i+1];
+	vi->ctrlq = vqs[total_vqs - 1];
+	for (i = 0; i < vq_pairs; i++) {
+		vi->rx[i].vq = vqs[rxq2vq(i)];
+		vi->tx[i].vq = vqs[txq2vq(i)];
+		vring_set_remote_peer_support(vi->rx[i].vq, true);
+		vring_set_remote_peer_support(vi->tx[i].vq, true);
+	}
 
 	kfree(names);
 	kfree(callbacks);
@@ -828,20 +914,21 @@ static void vpnet_free_queues(struct vpnet_info *vi)
 {
 	int i;
 
-	for (i = 0; i < vi->peer_vq_num / 2 + 2; i++) {
-		napi_hash_del(&vi->rq[i].napi);
-		netif_napi_del(&vi->rq[i].napi);
+	for (i = 0; i < vi->vq_pairs; i++) {
+		napi_hash_del(&vi->rx[i].napi);
+		netif_napi_del(&vi->rx[i].napi);
 	}
 
-	kfree(vi->rq);
+	kfree(vi->rx);
+	kfree(vi->tx);
 }
 
-static int vpnet_init_vqs(struct vpnet_info *vi)
+static int vpnet_init_engines(struct vpnet_info *vi)
 {
 	int ret;
 
-	/* Allocate receive queues */
-	ret = vpnet_alloc_rqs(vi);
+	/* Allocate own queues */
+	ret = vpnet_alloc_engines(vi);
 	if (ret)
 		goto err;
 
@@ -863,11 +950,11 @@ static int vpnet_open(struct net_device *dev)
 	int i;
 	printk(KERN_EMERG"%s called..\n", __func__);
 
-	for (i = 0; i < vi->rq_num; i++) {
+	for (i = 0; i < vi->vq_pairs; i++) {
 		/* Make sure we have some buffers: if oom use wq. */
-		if (!vpnet_try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+		if (!vpnet_try_fill_recv(vi, &vi->rx[i], GFP_KERNEL))
 			schedule_delayed_work(&vi->refill, 0);
-		vpnet_napi_enable(&vi->rq[i]);
+		vpnet_napi_enable(&vi->rx[i]);
 	}
 
 	return 0;
@@ -879,49 +966,50 @@ static int vpnet_close(struct net_device *dev)
 	return 0;
 }
 
-static noinline u32 vpnet_get_peer_buf(struct vpnet_info *vi, struct vpnet_peer_buf *buf)
+static noinline u32 vpnet_tx_get_peer_buf(struct vpnet_info *vi, struct vpnet_tx_peer_buf *buf)
 {
-	struct mirrored_vq *m_tq = vi->m_tq;
+	struct peer_virtqueue *peer_rx = &vi->tx[0].peer_rx;
 	struct peer_mem_info *pmem_info = &vi->pmem_info;
-	volatile struct vring *m_vr = &m_tq->vring;
-	volatile struct vring_avail *m_avail = m_vr->avail;
-	volatile u16 *avail_idx = &m_avail->idx;
+	volatile struct vring *rx_vring = &peer_rx->vring;
+	volatile struct vring_avail *rx_avail = rx_vring->avail;
+	volatile u16 *avail_idx = &rx_avail->idx;
 	unsigned int head, start;
-	struct vring_desc *m_desc;
+	struct vring_desc *desc;
 
 	/* wait if the peer haven't got fresh buf ready */
-	while (m_tq->last_avail_idx == *avail_idx);
+	while (peer_rx->last_avail_idx == *avail_idx);
 
-	start = m_tq->last_avail_idx & (m_vr->num - 1);
+	start = peer_rx->last_avail_idx & (rx_vring->num - 1);
 	/* grab the next head descriptor number */
-	head = m_avail->ring[start];
+	head = rx_avail->ring[start];
 	/* Sanity check */
-	if (unlikely(head > m_vr->num)) {
-		printk(KERN_EMERG"%s called: vring_head > vr->num \n",
+	if (unlikely(head > rx_vring->num)) {
+		printk(KERN_EMERG"%s called: vring_head > rx_vring->num \n",
 		       __func__);
 		return 0;
 	}
 
-	m_desc = m_vr->desc + head;
-	buf->addr = (volatile void *)peer_to_local(pmem_info, m_desc->addr);
-	buf->len = m_desc->len;
-	(m_tq->last_avail_idx)++;
+	desc = rx_vring->desc + head;
+	buf->addr = (volatile void *)peer_to_local(pmem_info, desc->addr);
+	buf->len = desc->len;
+	(peer_rx->last_avail_idx)++;
 	return head;
 }
 
-static inline void vpnet_xmit_to_peer(struct vpnet_info *vi, void *data, u64 len)
+static inline void vpnet_tx_engine_run(struct vpnet_info *vi, void *data, u64 len)
 {
-	struct vpnet_peer_buf buf;
+	struct vpnet_tx_peer_buf buf;
 	struct vring_used_elem head;
 
-	head.id = vpnet_get_peer_buf(vi, &buf);
+	head.id = vpnet_tx_get_peer_buf(vi, &buf);
 	if (len > buf.len) {
+		/* FIXME */
 		printk(KERN_EMERG"%s called: large len: len = %lld, buf.len = %d\n", __func__, len, buf.len);
 		len = buf.len;
 	}
 	memcpy((void *)buf.addr, data, len);
 	head.len = len;
-	vpnet_add_mvq_used_n(vi->m_tq, &head, 1);
+	vpnet_add_peer_used_n(&vi->tx[0].peer_rx, &head, 1);
 }
 
 static int xmit_skb(struct vpnet_info *vi, struct sk_buff *skb)
@@ -962,7 +1050,7 @@ static int xmit_skb(struct vpnet_info *vi, struct sk_buff *skb)
 	hdr->num_buffers = 1;
 
 	__skb_push(skb, hdr_len);
-	vpnet_xmit_to_peer(vi, skb->data, (u64)skb->len);
+	vpnet_tx_engine_run(vi, skb->data, (u64)skb->len);
 	__skb_pull(skb, hdr_len);
 
 	return 0;
@@ -983,6 +1071,8 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_orphan(skb);
 	nf_reset(skb);
 	dev_kfree_skb_any(skb);
+
+	virtqueue_kick(vi->tx[0].vq);
 
 	return NETDEV_TX_OK;
 }
@@ -1009,12 +1099,15 @@ static int vpnet_change_mtu(struct net_device *dev, int new_mtu)
 
 	if (new_mtu == 60001){
 		printk(KERN_EMERG"%s called: 60001 \n", __func__);
-		netif_carrier_on(vi->dev);
+//		netif_carrier_on(vi->dev);
 //		vpnet_mirrored_rq_avail_get_buf(vi);
+		virtqueue_kick(vi->tx->vq);
 		return 0;
 	} else if (new_mtu == 60002) {
 		printk(KERN_EMERG"%s called: 60002 \n", __func__);
-		netif_carrier_off(vi->dev);
+//		netif_carrier_off(vi->dev);
+		virtqueue_kick(vi->rx->vq);
+		return 0;
 	}
 
 	dev->mtu = new_mtu;
@@ -1027,7 +1120,6 @@ static struct rtnl_link_stats64 *vpnet_stats_func(struct net_device *dev,
 	struct vpnet_info *vi = netdev_priv(dev);
 	int cpu;
 	unsigned int start;
-	printk("%s called..\n", __func__);
 
 	for_each_possible_cpu(cpu) {
 		struct vpnet_stats *stats = per_cpu_ptr(vi->stats, cpu);
@@ -1224,12 +1316,12 @@ static int vpnet_probe(struct virtio_device *vdev)
 	struct device *host_dev;
 	struct pci_dev *pci_dev;
 	u64 bar2_base, bar2_len;
-	u16 peer_vq_num, mirror_vq_num;
+	u16 vq_pairs;
 	unsigned int nr_added_bufs;
 
-	virtio_cread((vdev), struct vhost_pci_net_config, peer_vq_num, &peer_vq_num);
+	virtio_cread((vdev), struct vhost_pci_net_config, vq_pairs, &vq_pairs);
 	/* Allocate ourselves a network device with room for our info */
-	dev = alloc_etherdev_mq(sizeof(struct vpnet_info), peer_vq_num / 2);
+	dev = alloc_etherdev_mq(sizeof(struct vpnet_info), vq_pairs);
 	if (!dev)
 		return -ENOMEM;
 
@@ -1259,25 +1351,18 @@ static int vpnet_probe(struct virtio_device *vdev)
 		u64_stats_init(&vpnet_stats->tx_syncp);
 		u64_stats_init(&vpnet_stats->rx_syncp);
 	}
-        vi->peer_vq_num = peer_vq_num;
-	vi->rq_num = peer_vq_num / 2;
-	vpnet_init_vqs(vi);
+        vi->vq_pairs = vq_pairs;
+	if (vpnet_init_engines(vi) < 0)
+		goto free;
 
-	INIT_WORK(&vi->crq_work, &crq_work_handler);
+	INIT_WORK(&vi->ctrlq_work, &ctrlq_work_handler);
 	INIT_WORK(&vi->config_work, vpnet_config_changed_work);
 
-	nr_added_bufs = vpnet_fill_queue(vi->crq);
+	nr_added_bufs = vpnet_fill_queue(vi->ctrlq);
 	if (!nr_added_bufs) {
 		printk(KERN_EMERG"%s called: Error allocating inbufs\n", __func__);
 		goto free;
 	}
-	mirror_vq_num = peer_vq_num / 2;
-	vi->m_tq = kzalloc(sizeof(*vi->m_tq) * mirror_vq_num, GFP_KERNEL);
-	if (!vi->m_tq)
-		goto free;
-	vi->mrq = kzalloc(sizeof(*vi->mrq) * mirror_vq_num, GFP_KERNEL);
-	if (!vi->mrq)
-		goto free;
 
 	host_dev = vdev->dev.parent;
 	pmem_info = &vi->pmem_info;
@@ -1395,7 +1480,7 @@ static void vpnet_remove(struct virtio_device *vdev)
         iounmap(pmem_info->pmem_base);
 	/* Make sure no work handler is accessing the device. */
 	flush_work(&vi->config_work);
-	flush_work(&vi->crq_work);
+	flush_work(&vi->ctrlq_work);
 
 	unregister_netdev(vi->dev);
 

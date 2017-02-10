@@ -2961,7 +2961,6 @@ static long kvm_vm_ioctl(struct file *filp,
 	}
 	case KVM_IOEVENTFD: {
 		struct kvm_ioeventfd data;
-
 		r = -EFAULT;
 		if (copy_from_user(&data, argp, sizeof(data)))
 			goto out;

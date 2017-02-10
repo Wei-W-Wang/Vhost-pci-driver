@@ -93,6 +93,9 @@ struct vring_virtqueue {
 	/* Last written value to avail->idx in guest byte order */
 	u16 avail_idx_shadow;
 
+	/* indicates the vring is used to support remote peers */
+	bool remote_peer_support;
+
 	/* How to notify other side. FIXME: commonalize hcalls! */
 	bool (*notify)(struct virtqueue *vq);
 
@@ -948,11 +951,17 @@ void *virtqueue_detach_unused_buf(struct virtqueue *_vq)
 }
 EXPORT_SYMBOL_GPL(virtqueue_detach_unused_buf);
 
+static bool is_remote_peer_support(struct vring_virtqueue *vq)
+{
+	return vq->remote_peer_support;
+}
+
 irqreturn_t vring_interrupt(int irq, void *_vq)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 
-	if (!more_used(vq)) {
+	if (!more_used(vq) && !is_remote_peer_support(vq)) {
+//		printk(KERN_EMERG"%s called: \n", __func__);
 		pr_debug("virtqueue interrupt with no work for %p\n", vq);
 		return IRQ_NONE;
 	}
@@ -1000,6 +1009,7 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
 	vq->avail_flags_shadow = 0;
 	vq->avail_idx_shadow = 0;
 	vq->num_added = 0;
+	vq->remote_peer_support = 0;
 	list_add_tail(&vq->vq.list, &vdev->vqs);
 #ifdef DEBUG
 	vq->in_use = false;
@@ -1181,6 +1191,14 @@ void vring_transport_features(struct virtio_device *vdev)
 	}
 }
 EXPORT_SYMBOL_GPL(vring_transport_features);
+
+void vring_set_remote_peer_support(struct virtqueue *_vq, bool on)
+{
+	struct vring_virtqueue *vq = to_vvq(_vq);
+
+	vq->remote_peer_support = on;
+}
+EXPORT_SYMBOL_GPL(vring_set_remote_peer_support);
 
 /**
  * virtqueue_get_vring_size - return the size of the virtqueue's vring

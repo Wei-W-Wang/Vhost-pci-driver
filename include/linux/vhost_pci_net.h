@@ -51,7 +51,7 @@ struct vhost_pci_net_config {
 	/*
 	 * Legal values are between 1 and 0x8000
 	 */
-	uint16_t peer_vq_num;
+	uint16_t vq_pairs;
 	/* See VPNET_S_* above */
 	uint16_t status;
 } QEMU_PACKED;

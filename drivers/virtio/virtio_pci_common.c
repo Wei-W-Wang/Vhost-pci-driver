@@ -151,19 +151,22 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 				       GFP_KERNEL);
 	if (!vp_dev->msix_entries)
 		goto error;
+
 	vp_dev->msix_names = kmalloc(nvectors * sizeof *vp_dev->msix_names,
 				     GFP_KERNEL);
 	if (!vp_dev->msix_names)
 		goto error;
+
 	vp_dev->msix_affinity_masks
 		= kzalloc(nvectors * sizeof *vp_dev->msix_affinity_masks,
 			  GFP_KERNEL);
 	if (!vp_dev->msix_affinity_masks)
 		goto error;
+
 	for (i = 0; i < nvectors; ++i)
 		if (!alloc_cpumask_var(&vp_dev->msix_affinity_masks[i],
 					GFP_KERNEL))
-			goto error;
+				goto error;
 
 	for (i = 0; i < nvectors; ++i)
 		vp_dev->msix_entries[i].entry = i;
@@ -172,6 +175,7 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 				    vp_dev->msix_entries, nvectors);
 	if (err)
 		goto error;
+
 	vp_dev->msix_enabled = 1;
 
 	/* Set the vector used for configuration */
@@ -183,6 +187,7 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 			  vp_dev);
 	if (err)
 		goto error;
+
 	++vp_dev->msix_used_vectors;
 
 	v = vp_dev->config_vector(vp_dev, v);
@@ -202,6 +207,7 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 				  vp_dev);
 		if (err)
 			goto error;
+
 		++vp_dev->msix_used_vectors;
 	}
 	return 0;
@@ -365,6 +371,7 @@ static int vp_try_to_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 			goto error_find;
 		}
 	}
+
 	return 0;
 
 error_find:

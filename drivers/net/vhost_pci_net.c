@@ -465,6 +465,21 @@ struct sk_buff *vpnet_buf_to_skb(struct vpnet_info *vi,
 	return skb;
 }
 
+/* FIXME: temporarily not used */
+static void disable_peer_notify(struct peer_virtqueue *pvq)
+{
+//	volatile __virtio16 *flags = &pvq->vring.used->flags;
+
+//	*flags |= VRING_USED_F_NO_NOTIFY;
+}
+
+static void enable_peer_notify(struct peer_virtqueue *pvq)
+{
+//	volatile __virtio16 *flags = &pvq->vring.used->flags;
+
+//	*flags |= ~VRING_USED_F_NO_NOTIFY;
+}
+
 static bool vpnet_rx_engine_poll(struct vpnet_rx_engine *rx)
 {
 	struct peer_virtqueue *peer_tx = &rx->peer_tx;
@@ -607,11 +622,11 @@ static int vpnet_poll(struct napi_struct *napi, int budget)
 
 	/* Out of Packets */
 	if (received < budget) {
-//		r = virtqueue_enable_cb_prepare(rx->vq);
+		enable_peer_notify(&rx->peer_tx);
 		napi_complete_done(napi, received);
 		if (unlikely(vpnet_rx_engine_poll(rx)) &&
 		    napi_schedule_prep(napi)) {
-//			virtqueue_disable_cb(rx->vq);
+			disable_peer_notify(&rx->peer_tx);
 			__napi_schedule(napi);
 
 		}
@@ -814,6 +829,15 @@ static void ctrlq_intr(struct virtqueue *ctrlq)
 
 	schedule_work(&vi->ctrlq_work);
 }
+#if 0
+/* Converting between virtqueue no. and kernel tx/rx queue no.
+ * 0:rx0 1:tx0 2:rx1 3:tx1 ... 2N:rxN 2N+1:txN 2N+2:cvq
+ */
+static int vq2tx(struct virtqueue *vq)
+{
+	return (vq->index - 1) / 2;
+}
+#endif
 
 static int vq2rx(struct virtqueue *vq)
 {
@@ -826,7 +850,7 @@ static void skb_recv_done(struct virtqueue *vq)
 	struct vpnet_rx_engine *rx = &vi->rx[vq2rx(vq)];
 	/* Schedule NAPI, Suppress further interrupts if successful. */
 	if (napi_schedule_prep(&rx->napi)) {
-//		virtqueue_disable_cb(vq);
+		disable_peer_notify(&rx->peer_tx);
 		__napi_schedule(&rx->napi);
 	}
 }
@@ -834,6 +858,17 @@ static void skb_recv_done(struct virtqueue *vq)
 static void skb_xmit_done(struct virtqueue *vq)
 {
 //	printk(KERN_EMERG"%s called..\n", __func__);
+#if 0
+	struct vpnet_info *vi = vq->vdev->priv;
+	struct vpnet_tx_engine *tx = &vi->tx[vq2tx(vq)];
+
+	if (tx->peer_rx.vring.desc) {
+		disable_peer_notify(&tx->peer_rx);
+
+		/* We were probably waiting for more output buffers. */
+		netif_wake_subqueue(vi->dev, vq2tx(vq));
+	}
+#endif
 }
 
 static int rxq2vq(int rxq)
@@ -1056,6 +1091,16 @@ static int xmit_skb(struct vpnet_info *vi, struct sk_buff *skb)
 	return 0;
 }
 
+static inline bool should_notify_peer(struct peer_virtqueue *pvq)
+{
+	volatile __virtio16 *flags = &pvq->vring.avail->flags;
+
+	if (*flags & VRING_AVAIL_F_NO_INTERRUPT)
+		return 0;
+	else
+		return 1;
+}
+
 static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct vpnet_info *vi = netdev_priv(dev);
@@ -1072,7 +1117,8 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	nf_reset(skb);
 	dev_kfree_skb_any(skb);
 
-	virtqueue_kick(vi->tx[0].vq);
+	if (should_notify_peer(&vi->tx[0].peer_rx))
+		virtqueue_notify(vi->tx[0].vq);
 
 	return NETDEV_TX_OK;
 }

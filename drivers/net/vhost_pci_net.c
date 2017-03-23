@@ -1105,6 +1105,9 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct vpnet_info *vi = netdev_priv(dev);
 	struct vpnet_stats *stats = this_cpu_ptr(vi->stats);
+	int qnum = skb_get_queue_mapping(skb);
+	struct netdev_queue *txq = netdev_get_tx_queue(dev, qnum);
+	bool kick = !skb->xmit_more;
 
 	xmit_skb(vi, skb);
 
@@ -1117,7 +1120,8 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	nf_reset(skb);
 	dev_kfree_skb_any(skb);
 
-	if (should_notify_peer(&vi->tx[0].peer_rx))
+	if ((kick || netif_xmit_stopped(txq)) &&
+	    should_notify_peer(&vi->tx[0].peer_rx))
 		virtqueue_notify(vi->tx[0].vq);
 
 	return NETDEV_TX_OK;

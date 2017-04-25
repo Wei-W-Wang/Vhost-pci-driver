@@ -34,29 +34,23 @@
 #include <linux/virtio_types.h>
 #include <linux/if_ether.h>
 
-struct pmem_region_msg {
-	uint64_t gpa;
-	uint64_t size;
-};
-
-#define MAX_GUEST_REGION 8
-struct peer_mem_msg {
-	uint32_t nregions;
-	struct pmem_region_msg regions[MAX_GUEST_REGION];
-};
-
 #define VPNET_S_LINK_UP	1	/* Link is up */
 
 struct vhost_pci_net_config {
 	/*
 	 * Legal values are between 1 and 0x8000
 	 */
-	uint16_t peer_vq_num;
+	uint16_t vq_pairs;
 	/* See VPNET_S_* above */
 	uint16_t status;
-} QEMU_PACKED;
+};
 
-struct peer_vq_msg {
+struct ctrlq_msg_remote_mem {
+	uint64_t gpa;
+	uint64_t size;
+};
+
+struct ctrlq_msg_remoteq {
 	uint16_t last_avail_idx;
         int32_t  vring_enable;
 	uint32_t vring_num;
@@ -65,25 +59,20 @@ struct peer_vq_msg {
 	uint64_t used_gpa;
 };
 
-struct peer_vqs_msg {
-	uint32_t nvqs;
-	struct peer_vq_msg pvq_msg[];
-};
-
-#define VHOST_PCI_CTRL_PEER_MEM_MSG    0
-#define VHOST_PCI_CTRL_PEER_VQ_MSG     1
-struct vpnet_controlq_msg {
+#define VHOST_PCI_CTRLQ_MSG_REMOTE_MEM	0
+#define VHOST_PCI_CTRLQ_MSG_REMOTEQ	1
+struct vpnet_ctrlq_msg {
 	uint8_t class;
 	uint8_t cmd;
 	uint16_t size;
         union {
-		struct peer_mem_msg pmem_msg;
-		struct peer_vqs_msg pvqs_msg;
+		struct ctrlq_msg_remote_mem msg_remote_mem[0];
+		struct ctrlq_msg_remoteq msg_remoteq[0];
 	} payload;
 } __attribute__((packed));
 
-static struct vpnet_controlq_msg vpnet_msg __attribute__ ((unused));
-#define VPNET_CQ_MSG_HDR_SIZE (sizeof(vpnet_msg.class) \
+static struct vpnet_ctrlq_msg vpnet_msg __attribute__ ((unused));
+#define VPNET_CTRLQ_MSG_HDR_SIZE (sizeof(vpnet_msg.class) \
 			      + sizeof(vpnet_msg.cmd)  \
 			      + sizeof(vpnet_msg.size))
 

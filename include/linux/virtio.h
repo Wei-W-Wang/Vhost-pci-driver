@@ -76,7 +76,7 @@ unsigned int virtqueue_get_vring_size(struct virtqueue *vq);
 
 bool virtqueue_is_broken(struct virtqueue *vq);
 
-void vring_set_remote_peer_support(struct virtqueue *_vq, bool on);
+void set_remote_vq_support(struct virtqueue *_vq, bool on);
 
 const struct vring *virtqueue_get_vring(struct virtqueue *vq);
 dma_addr_t virtqueue_get_desc_addr(struct virtqueue *vq);

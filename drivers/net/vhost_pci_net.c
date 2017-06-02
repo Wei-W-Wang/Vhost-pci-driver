@@ -175,6 +175,7 @@ struct vpnet_info {
 
 	/* CPU hot plug notifier */
 	struct notifier_block nb;
+	bool ready;
 };
 
 struct vpnet_tx_remote_buf {
@@ -617,7 +618,13 @@ static int vpnet_poll(struct napi_struct *napi, int budget)
 {
 	struct vpnet_rx_engine *rx =
 		container_of(napi, struct vpnet_rx_engine, napi);
+	struct vpnet_info *vi = rx->vq->vdev->priv;
 	unsigned int received = 0;
+
+	if (!vi->ready) {
+		printk(KERN_EMERG"%s called: not ready \n", __func__);
+		return 0;
+	}
 
 	received = vpnet_rx_engine_run(rx, budget);
 
@@ -761,6 +768,8 @@ printk(KERN_EMERG"%s called.. 1\n", __func__);
 			remote_tx->enabled = msg_remoteq->vring_enable;
 		}
 	}
+
+	vi->ready = true;
 }
 
 static void vpnet_config_changed_work(struct work_struct *work)
@@ -841,6 +850,7 @@ static void skb_recv_done(struct virtqueue *vq)
 {
 	struct vpnet_info *vi = vq->vdev->priv;
 	struct vpnet_rx_engine *rx = &vi->rx[vq2rx(vq)];
+
 	/* Schedule NAPI, Suppress further interrupts if successful. */
 	if (napi_schedule_prep(&rx->napi)) {
 		disable_remote_notify(&rx->remote_tx);
@@ -1424,6 +1434,7 @@ static int vpnet_probe(struct virtio_device *vdev)
 	}
 
 	netif_carrier_off(dev);
+	vi->ready = false;
 
 	virtio_device_ready(vdev);
 
